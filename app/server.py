@@ -18,9 +18,9 @@ from urllib.parse import urlparse
 
 from solver import ValidationError, recompute, solve
 from storage import (
+    SubmissionConflictError,
     init_db,
     load_submission,
-    load_submission_for_key,
     save_submission,
 )
 
@@ -113,14 +113,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         submission_key = data.get("submission_key")
-        if isinstance(submission_key, str) and submission_key:
-            prior = load_submission_for_key(submission_key)
-            if prior is not None:
-                self._send_json(200, prior)
-                return
+        if submission_key is not None and not isinstance(submission_key, str):
+            self._send_json(400, {
+                "error": "提交身份格式非法",
+                "errors": [{"field": "submission_key",
+                            "message": "提交身份（submission_key）必须是字符串"}],
+            })
+            return
 
         channels = data.get("channels")
         checks = data.get("checks")
+        # 先校验并求解本次观测：非法输入一律 400，绝不因提交身份
+        # 命中旧记录而回放旧证据。
         try:
             result = solve(channels, checks)
         except ValidationError as exc:
@@ -157,12 +161,23 @@ class Handler(BaseHTTPRequestHandler):
             {"channels": list(members), "parity": parity}
             for members, parity in norm_checks
         ]}
-        review_id = save_submission(payload, conclusion, submission_key)
-        self._send_json(200, {
-            "review_id": review_id,
-            "input": payload,
-            "conclusion": conclusion,
-        })
+        try:
+            review_id, _created = save_submission(payload, conclusion, submission_key)
+        except SubmissionConflictError as exc:
+            # 同一提交身份被用于不同内容：明确拒绝，不回放旧结果。
+            self._send_json(409, {
+                "error": "提交身份冲突：该 submission_key 已绑定不同的观测内容",
+                "field": "submission_key",
+                "errors": [{
+                    "field": "submission_key",
+                    "message": "同一提交身份不能用于不同内容；请核对提交内容，"
+                               "或为本次观测使用新的提交身份",
+                }],
+                "existing_review_id": exc.review_id,
+            })
+            return
+        # 新建与重试命中都返回已持久化的同一条记录，保证证据一致。
+        self._send_json(200, load_submission(review_id))
 
 
 def _normalize_checks_for_recompute(ordered_channels, raw_checks):

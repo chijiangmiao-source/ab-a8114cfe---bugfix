@@ -2,8 +2,10 @@
 
 // ---------- 校验行的动态编辑 ----------
 const checksBox = document.getElementById("checks");
-let activeSubmissionKey = null;
 
+// 每次点击“提交求解”都生成全新的提交身份（一次新的逻辑提交 =
+// 一条独立的复核记录）；网络自动重试复用同一身份，服务端据此
+// 幂等返回同一记录，不会重复建档。
 function makeSubmissionKey() {
   if (window.crypto && typeof window.crypto.randomUUID === "function") {
     return window.crypto.randomUUID();
@@ -52,8 +54,7 @@ function collectPayload() {
     const parity = rawParity === "0" || rawParity === "1" ? Number(rawParity) : rawParity;
     checks.push({ channels: members, parity });
   }
-  if (!activeSubmissionKey) activeSubmissionKey = makeSubmissionKey();
-  return { channels, checks, submission_key: activeSubmissionKey };
+  return { channels, checks };
 }
 
 // ---------- 证据区与错误区 ----------
@@ -142,8 +143,30 @@ function renderConclusion(data) {
 }
 
 // ---------- 提交 ----------
+// 网络错误时以同一提交身份自动重试：服务端对同身份同内容幂等，
+// 重试稳定取得同一复核记录；同身份不同内容会被 409 拒绝。
+async function postSubmission(payload, maxAttempts = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fetch("/api/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 document.getElementById("addCheck").addEventListener("click", () => addCheckRow());
-document.getElementById("submitBtn").addEventListener("click", async () => {
+const submitBtn = document.getElementById("submitBtn");
+submitBtn.addEventListener("click", async () => {
   clearEvidence();
   let payload;
   try {
@@ -152,19 +175,22 @@ document.getElementById("submitBtn").addEventListener("click", async () => {
     showErrors({ errors: [{ field: "form", message: String(err) }] });
     return;
   }
+  // 一次新的逻辑提交：生成全新提交身份；本次点击内的自动重试
+  // 复用该身份，下一次点击再换新身份。
+  payload.submission_key = makeSubmissionKey();
+  submitBtn.disabled = true;
   let resp;
   try {
-    resp = await fetch("/api/submit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    resp = await postSubmission(payload);
   } catch (err) {
-    showErrors({ errors: [{ field: "network", message: `请求失败: ${err}` }] });
+    showErrors({ errors: [{ field: "network", message: `请求失败（含自动重试）: ${err}` }] });
     return;
+  } finally {
+    submitBtn.disabled = false;
   }
   const data = await resp.json().catch(() => null);
   if (!resp.ok) {
+    // 400（非法输入）/ 409（提交身份冲突）：保留编辑内容、清除旧证据。
     showErrors(data);
     return;
   }

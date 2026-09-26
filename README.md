@@ -35,31 +35,49 @@ APP_PORT=9090 docker compose up -d app
 
 ## 复核
 
-- `POST /api/submit`：`{"channels": [...], "checks": [{"channels": [...], "parity": 0|1}]}`
+- `POST /api/submit`：`{"channels": [...], "checks": [{"channels": [...], "parity": 0|1}], "submission_key": "可选"}`
 - `GET /api/review/<复核编号>`：取回提交内容、结论与逐校验复算。
 - 非法输入返回 `400`，`errors[].field` 为可定位字段（如
   `channels[2]`、`checks[0].channels`、`checks[0].parity`），不保存
   记录；页面保留编辑内容并清除旧证据。
+
+### 提交身份（submission_key）与幂等
+
+每次新的逻辑提交都会生成并保存**独立的复核记录**，其输入、最小故障
+向量、逐校验复算与不可行结论只对应本次观测。页面在每次点击提交时
+生成全新的 `submission_key`；网络自动重试复用同一身份：
+
+- 同身份 + 同内容（网络重试）→ 稳定返回首次保存的同一记录；
+- 同身份 + 不同内容 → `409` 明确拒绝（`errors[].field` 为
+  `submission_key`），不回放旧结果，旧记录不被覆盖；
+- 非法输入先校验先拒绝（`400`），即使身份已被使用也绝不回放旧证据，
+  且非法提交不占用该身份；
+- 相同重试并发到达只形成一条记录；绑定关系与内容摘要持久化在
+  SQLite 中，服务重启后重试语义、既有复核编号与各自证据保持一致。
 
 复核记录持久化在命名卷 `locator-data`（容器内 `/data/locator.db`）。
 
 ## verify 服务
 
 ```bash
-docker compose up --build verify
+docker compose up --build --exit-code-from verify
 ```
 
-`verify` 服务对唯一故障、多解裁决、不可行用例运行代码测试
-（`tests/test_solver.py`）与接口测试（`tests/test_api.py`），执行
-字节码构建检查（`compileall`），并对运行中的 `app` 服务做 API 冒烟
-（`tests/smoke_api.py`：健康检查、提交、裁决、不可行持久化、可定位
-拒绝、刷新取回）。全部通过后退出并返回 `0`；任一步失败返回非零码。
+`verify` 服务运行代码测试（`tests/test_solver.py`、
+`tests/test_api.py`：唯一故障、多解裁决、不可行、提交身份幂等/冲突/
+并发/重启语义），执行字节码构建检查（`compileall`），在同一数据库
+上重启本地服务实例验证重启后的复核取回（`tests/smoke_restart.py`），
+并对运行中的 `app` 服务做真实 HTTP 冒烟（`tests/smoke_api.py`：健康
+检查、提交、裁决、不可行持久化、可定位拒绝、同页两次观测各自建档、
+同次重试一致、异内容重用 409、并发重试只建一条记录、刷新取回）。
+全部通过后退出并返回 `0`；任一步失败返回非零码。
 
 本地不使用 Docker 时也可直接运行（仅需 Python 3.11 标准库）：
 
 ```bash
 python tests/test_solver.py
 python tests/test_api.py
-APP_DB=/tmp/l.db python app/server.py
+python tests/smoke_restart.py
+APP_DB=/tmp/l.db python app/server.py &
 APP_URL=http://127.0.0.1:8080 python tests/smoke_api.py
 ```
