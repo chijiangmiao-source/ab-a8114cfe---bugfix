@@ -25,6 +25,13 @@ services:
     environment:
       APP_URL: http://app:8080
       APP_DB: /tmp/verify.db
+      # 重启持久性检查：以 app 的持久化数据库启动全新进程复核取回。
+      RESTART_CHECK_DB: /data/locator.db
+      # 复核状态文件：供容器外部重启后的第二轮核对（SMOKE_RECHECK_ONLY=1）。
+      SMOKE_STATE_FILE: /verify-state/smoke_state.json
+    volumes:
+      - locator-data:/data
+      - verify-state:/verify-state
     depends_on:
       app:
         condition: service_healthy
@@ -35,3 +42,4 @@ services:
 
 volumes:
   locator-data:
+  verify-state:

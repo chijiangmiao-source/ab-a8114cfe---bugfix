@@ -13,9 +13,9 @@ COPY app/ ./app/
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/
 
-RUN mkdir -p /data \
+RUN mkdir -p /data /verify-state \
     && useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /data /app
+    && chown -R appuser:appuser /data /verify-state /app
 USER appuser
 
 VOLUME ["/data"]

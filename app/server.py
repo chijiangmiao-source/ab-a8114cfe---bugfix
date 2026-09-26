@@ -6,6 +6,13 @@ GET  /                     录入页面
 GET  /healthz              健康检查
 POST /api/submit           提交通道与校验，求解并保存结论，返回复核编号
 GET  /api/review/<id>      按复核编号取回提交内容与结论
+
+提交语义
+--------
+每次合法提交（含不可行结论）都独立保存一条复核记录。客户端为每次
+逻辑提交生成 ``submission_key``：同一身份 + 相同内容的网络重试返回
+同一条记录；同一身份被用于不同内容时以 409 明确拒绝，绝不回放旧
+结果；非法输入以 400 拒绝且不占用提交身份、不返回任何旧证据。
 """
 
 from __future__ import annotations
@@ -20,12 +27,12 @@ from solver import ValidationError, recompute, solve
 from storage import (
     init_db,
     load_submission,
-    load_submission_for_key,
     save_submission,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_BODY = 1 << 20  # 1 MiB
+MAX_KEY_LEN = 128
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -113,14 +120,31 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         submission_key = data.get("submission_key")
-        if isinstance(submission_key, str) and submission_key:
-            prior = load_submission_for_key(submission_key)
-            if prior is not None:
-                self._send_json(200, prior)
+        if submission_key is not None:
+            if not isinstance(submission_key, str):
+                self._send_json(400, {
+                    "error": "提交身份非法",
+                    "field": "submission_key",
+                    "errors": [{"field": "submission_key",
+                                "message": "提交身份必须是字符串"}],
+                })
+                return
+            submission_key = submission_key.strip()
+            if not submission_key:
+                submission_key = None
+            elif len(submission_key) > MAX_KEY_LEN:
+                self._send_json(400, {
+                    "error": "提交身份非法",
+                    "field": "submission_key",
+                    "errors": [{"field": "submission_key",
+                                "message": f"提交身份长度不得超过 {MAX_KEY_LEN} 字符"}],
+                })
                 return
 
         channels = data.get("channels")
         checks = data.get("checks")
+        # 先校验输入：非法内容一律 400 拒绝，不触碰提交身份绑定，
+        # 也绝不因此返回任何既有记录（旧证据由前端清除）。
         try:
             result = solve(channels, checks)
         except ValidationError as exc:
@@ -157,7 +181,27 @@ class Handler(BaseHTTPRequestHandler):
             {"channels": list(members), "parity": parity}
             for members, parity in norm_checks
         ]}
-        review_id = save_submission(payload, conclusion, submission_key)
+        outcome, review_id, stored = save_submission(payload, conclusion, submission_key)
+        if outcome == "conflict":
+            # 同一提交身份被用于不同内容：明确拒绝，不保存、不回放。
+            self._send_json(409, {
+                "error": "提交身份已绑定其它观测内容，本次提交被拒绝",
+                "field": "submission_key",
+                "errors": [{
+                    "field": "submission_key",
+                    "message": (
+                        "该提交身份已用于不同的观测内容"
+                        f"（已绑定复核编号 {review_id}）；"
+                        "这是一次新的观测时，请以新的提交身份重新提交"
+                    ),
+                }],
+                "existing_review_id": review_id,
+            })
+            return
+        if outcome == "existing":
+            # 同一逻辑提交的网络重试：稳定返回既有记录。
+            self._send_json(200, stored)
+            return
         self._send_json(200, {
             "review_id": review_id,
             "input": payload,
@@ -166,13 +210,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _normalize_checks_for_recompute(ordered_channels, raw_checks):
-    """把提交的校验按已排序通道名规范化（去本条重复、去整组重复）。"""
+    """把提交的校验按已排序通道名规范化（去本条重复、去整组重复）。
+
+    与求解器一致，同时接受对象形式 {"channels": [...], "parity": 0/1}
+    与 [通道集合, 奇偶值] 数组形式。
+    """
     seen_sets: set[frozenset[str]] = set()
     out = []
     for ck in raw_checks:
+        if isinstance(ck, dict):
+            raw_members = ck.get("channels", [])
+            raw_parity = ck.get("parity")
+        else:
+            raw_members, raw_parity = ck[0], ck[1]
         members = []
         local: set[str] = set()
-        for name in ck.get("channels", []):
+        for name in raw_members:
             name = name.strip()
             if name in ordered_channels and name not in local:
                 local.add(name)
@@ -181,7 +234,7 @@ def _normalize_checks_for_recompute(ordered_channels, raw_checks):
         key = frozenset(members)
         if members and key not in seen_sets:
             seen_sets.add(key)
-            out.append((tuple(members), int(ck["parity"])))
+            out.append((tuple(members), int(raw_parity)))
     return out
 
 

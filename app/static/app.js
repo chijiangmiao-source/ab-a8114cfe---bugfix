@@ -2,8 +2,10 @@
 
 // ---------- 校验行的动态编辑 ----------
 const checksBox = document.getElementById("checks");
-let activeSubmissionKey = null;
 
+// 每次点击“提交求解”都视为一次新的逻辑提交，生成全新的提交身份；
+// 同一身份仅在网络层重试同一次提交时复用（见 submitWithRetry），
+// 服务端据此保证：重试返回同一记录，身份换内容则被明确拒绝。
 function makeSubmissionKey() {
   if (window.crypto && typeof window.crypto.randomUUID === "function") {
     return window.crypto.randomUUID();
@@ -52,10 +54,9 @@ function collectPayload() {
     const parity = rawParity === "0" || rawParity === "1" ? Number(rawParity) : rawParity;
     checks.push({ channels: members, parity });
   }
-  if (!activeSubmissionKey) activeSubmissionKey = makeSubmissionKey();
-  return { channels, checks, submission_key: activeSubmissionKey };
+  // 每次收集（对应一次新的提交点击）都生成全新的提交身份。
+  return { channels, checks, submission_key: makeSubmissionKey() };
 }
-
 // ---------- 证据区与错误区 ----------
 const resultBox = document.getElementById("result");
 const errorBox = document.getElementById("errors");
@@ -142,8 +143,31 @@ function renderConclusion(data) {
 }
 
 // ---------- 提交 ----------
+// 网络错误（连接断开、超时等）下以完全相同的请求体重试：
+// 同一 submission_key + 同一内容，服务端幂等返回同一复核记录，
+// 不会生成重复记录。HTTP 层响应（400/409 等）不重试。
+async function submitWithRetry(body, maxAttempts = 3) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fetch("/api/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+    } catch (err) {
+      lastErr = err;
+      if (attempt + 1 < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 document.getElementById("addCheck").addEventListener("click", () => addCheckRow());
-document.getElementById("submitBtn").addEventListener("click", async () => {
+const submitBtn = document.getElementById("submitBtn");
+submitBtn.addEventListener("click", async () => {
   clearEvidence();
   let payload;
   try {
@@ -152,19 +176,22 @@ document.getElementById("submitBtn").addEventListener("click", async () => {
     showErrors({ errors: [{ field: "form", message: String(err) }] });
     return;
   }
+  // 本次逻辑提交的请求体（含提交身份）在此固定，网络重试原样复用。
+  const body = JSON.stringify(payload);
+  submitBtn.disabled = true;
   let resp;
   try {
-    resp = await fetch("/api/submit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    resp = await submitWithRetry(body);
   } catch (err) {
     showErrors({ errors: [{ field: "network", message: `请求失败: ${err}` }] });
     return;
+  } finally {
+    submitBtn.disabled = false;
   }
   const data = await resp.json().catch(() => null);
   if (!resp.ok) {
+    // 400：输入非法（编辑内容保留、旧证据已清除）；
+    // 409：提交身份被复用于不同内容（明确拒绝，未回放旧结果）。
     showErrors(data);
     return;
   }
